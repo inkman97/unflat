@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unflat"
+version = "0.2.0"
+description = "Unflatten control-flow flattened x64 PE code and map bytecode virtual machines"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["capstone>=5", "unicorn>=2", "pefile>=2023.2.7"]
+
+[project.scripts]
+unflat = "unflat.cli:main"
+
+[tool.setuptools]
+packages = ["unflat"]
