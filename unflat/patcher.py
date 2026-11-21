@@ -26,8 +26,7 @@ def _relocate(code, va, new_va):
 
 class Cave:
     def __init__(self, image):
-        end = max(s.end for s in image.sections)
-        self.va = (end + 0xFFF) & ~0xFFF
+        self.va = (image.end + 0xFFF) & ~0xFFF
         self.data = bytearray()
 
     def add(self, code, keep, target):
@@ -105,10 +104,22 @@ def apply(image, code, dispatches):
             continue
         va, raw = p
         off = image.file_offset(va)
+        d.patch = (va, bytes(image.raw[off:off + len(raw)]), raw)
         image.raw[off:off + len(raw)] = raw
         patched.append(d)
     if cave.data:
-        _add_section(image, ".unflat", cave.va, bytes(cave.data))
+        try:
+            if image.fmt == "pe":
+                _add_section(image, ".unflat", cave.va, bytes(cave.data))
+            else:
+                _add_segment(image, cave.va, bytes(cave.data))
+        except RuntimeError:
+            # No room for the cave: undo the patches that jump into it, keep the in-place ones.
+            cave_lo, cave_hi = cave.va, cave.va + len(cave.data)
+            for d in [d for d in patched if any(cave_lo <= t < cave_hi for t in _jump_targets(image, code, d))]:
+                patched.remove(d)
+                skipped.append(d)
+                _restore(image, code, d)
     return patched, skipped
 
 
@@ -129,3 +140,53 @@ def _add_section(image, name, va, data):
     struct.pack_into("<8sIIIIIIHHI", raw, header, name.encode(), len(data), va - image.base, size, ptr, 0, 0, 0, 0, SECTION_FLAGS)
     struct.pack_into("<H", raw, nt + 6, count + 1)
     struct.pack_into("<I", raw, nt + 24 + 56, (va - image.base + len(data) + salign - 1) & ~(salign - 1))
+
+
+def _jump_targets(image, code, d):
+    va, _, raw = d.patch
+    out, i = [], 0
+    while i < len(raw):
+        if raw[i] == 0xE9:
+            out.append(va + i + 5 + struct.unpack_from("<i", raw, i + 1)[0]); i += 5
+        elif raw[i] == 0x0F and i + 1 < len(raw) and raw[i + 1] & 0xF0 == 0x80:
+            out.append(va + i + 6 + struct.unpack_from("<i", raw, i + 2)[0]); i += 6
+        else:
+            i += 1
+    return out
+
+
+def _restore(image, code, d):
+    va, old, _ = d.patch
+    off = image.file_offset(va)
+    image.raw[off:off + len(old)] = old
+
+
+PT_LOAD, PT_NOTE, PF_RX = 1, 4, 5
+PHDR = struct.Struct("<IIQQQQQQ")
+
+
+def _add_segment(image, va, data):
+    """ELF: append the cave to the file and map it by turning a PT_NOTE program header into a PT_LOAD (R+X).
+
+    The new PT_LOAD is moved right after the last existing PT_LOAD, so loadable segments stay sorted by address
+    (the kernel sizes the mapping of PIE binaries from the first and last PT_LOAD entries).
+    """
+    raw = image.raw
+    phoff = struct.unpack_from("<Q", raw, 0x20)[0]
+    phentsize, phnum = struct.unpack_from("<HH", raw, 0x36)
+    if phentsize != PHDR.size:
+        raise RuntimeError("unexpected ELF program header size")
+    phdrs = [list(PHDR.unpack_from(raw, phoff + i * phentsize)) for i in range(phnum)]
+    note = next((i for i, p in enumerate(phdrs) if p[0] == PT_NOTE), None)
+    if note is None:
+        raise RuntimeError("no PT_NOTE program header to reuse for the cave segment")
+    raw += b"\0" * (-len(raw) % 0x1000)
+    off = len(raw)
+    raw += data
+    entry = phdrs.pop(note)
+    entry[:] = [PT_LOAD, PF_RX, off, va, va, len(data), len(data), 0x1000]
+    last_load = max(i for i, p in enumerate(phdrs) if p[0] == PT_LOAD)
+    phdrs.insert(last_load + 1, entry)
+    for i, p in enumerate(phdrs):
+        PHDR.pack_into(raw, phoff + i * phentsize, *p)
+    image.segments.append(type(image.segments[0])(va, len(data), off, len(data)))

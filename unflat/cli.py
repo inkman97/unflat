@@ -12,17 +12,17 @@ MODES = ("scan", "flat", "vm")
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(prog="unflat", description="Static helpers for obfuscated x64 PE code.")
+    p = argparse.ArgumentParser(prog="unflat", description="Static helpers for obfuscated x64 code (Windows PE and Linux ELF).")
     p.add_argument("--version", action="version", version=f"unflat {__version__}")
     sub = p.add_subparsers(dest="mode", required=True)
 
     s = sub.add_parser("scan", help="detect control-flow flattening and bytecode VM dispatchers, per function")
-    s.add_argument("input", help="x64 PE file")
+    s.add_argument("input", help="x64 PE or x86-64 ELF file")
     s.add_argument("-o", "--output", help="write the report to a file instead of stdout")
     s.add_argument("-v", "--verbose", action="store_true", help="list every flagged function and every function with indirect jumps")
 
     f = sub.add_parser("flat", help="resolve and patch out register-indirect dispatchers (control-flow flattening)")
-    f.add_argument("input", help="x64 PE file (exe/dll, or a pe-sieve dump)")
+    f.add_argument("input", help="x64 PE (exe/dll, or a pe-sieve dump) or x86-64 ELF (executable, PIE, shared object)")
     f.add_argument("-o", "--output", help="write a patched copy with dispatchers replaced by direct jumps")
     f.add_argument("-l", "--listing", help="write a text listing that follows the recovered control flow")
     f.add_argument("-d", "--dot", help="write the recovered control flow graph in Graphviz DOT format")
@@ -33,10 +33,10 @@ def parse_args(argv):
     f.add_argument("-v", "--verbose", action="store_true", help="print every dispatcher")
 
     v = sub.add_parser("vm", help="trace a virtualized function: dispatcher, handlers, bytecode and virtual program")
-    v.add_argument("input", help="x64 PE file")
-    v.add_argument("-e", "--entry", required=True, help="address or export name of the function that runs the VM")
+    v.add_argument("input", help="x64 PE or x86-64 ELF file")
+    v.add_argument("-e", "--entry", required=True, help="address, export name (PE) or symbol name (ELF) of the function that runs the VM")
     v.add_argument("-a", "--arg", action="append", type=lambda s: int(s, 0), default=[],
-                   help="integer argument passed in rcx, rdx, r8, r9 (repeatable)")
+                   help="integer argument (repeatable): rcx, rdx, r8, r9 for PE; rdi, rsi, rdx, rcx, r8, r9 for ELF")
     v.add_argument("-n", "--max", type=int, default=2_000_000, help="maximum native instructions to emulate")
     v.add_argument("-o", "--output", help="write the report to a file instead of stdout")
 
@@ -82,9 +82,8 @@ def _entry(image, value):
     try:
         return int(value, 0)
     except ValueError:
-        for exp in getattr(getattr(image.pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []) or []:
-            if exp.name and exp.name.decode() == value:
-                return image.base + exp.address
+        if value in image.symbols:
+            return image.symbols[value]
     raise SystemExit(f"entry not found: {value}")
 
 

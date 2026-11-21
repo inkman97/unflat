@@ -83,11 +83,9 @@ class Code:
 
 def discover_functions(image, code):
     starts = set()
-    entry = image.pe.OPTIONAL_HEADER.AddressOfEntryPoint
-    if entry:
-        starts.add(image.base + entry)
-    for exp in getattr(getattr(image.pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []) or []:
-        starts.add(image.base + exp.address)
+    if image.entry:
+        starts.add(image.entry)
+    starts.update(image.symbols.values())
     for va in code.addrs:
         size, mnem, ops = code.lite[va]
         if mnem == "call" and ops.startswith("0x"):

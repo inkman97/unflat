@@ -1,6 +1,6 @@
 # unflat
 
-Three helpers for obfuscated x64 PE files:
+Three helpers for obfuscated x86-64 code, in Windows PE and Linux ELF files:
 
 - **`unflat scan`**: tells you, per function, whether the code is control-flow flattened or runs a bytecode VM, and which command to run next.
 - **`unflat flat`**: resolves the register-indirect dispatchers of control-flow flattened code and patches them back into direct jumps, so that Ghidra, IDA or r2 can follow the code again.
@@ -14,7 +14,25 @@ pip install git+https://github.com/inkman97/unflat.git
 
 or, from a clone, `pip install .`
 
-Works on Linux and Windows (Python 3.9+, capstone, unicorn, pefile).
+Works on Linux and Windows (Python 3.9+, capstone, unicorn, pefile, pyelftools).
+
+## PE and ELF
+
+The file format is detected from the magic bytes; every mode works the same on both.
+
+| | PE (x64) | ELF (x86-64) |
+|---|---|---|
+| addresses | `ImageBase`-based | `p_vaddr` (0-based for PIE / static-pie, like r2 and objdump) |
+| function ranges | `.pdata` | `.symtab`/`.dynsym` sizes and `.eh_frame` FDEs; `.eh_frame_hdr` through `PT_GNU_EH_FRAME` when section headers are stripped |
+| fallback | entry point, exports, direct `call` targets | entry point, symbols, direct `call` targets |
+| `vm -e` name | export | symbol |
+| arguments (`vm -a`) | `rcx`, `rdx`, `r8`, `r9` | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` |
+| thread block in the emulator | TEB at `gs:0` | TCB at `fs:0`, stack canary at `fs:0x28` |
+| imports in the emulator | unmapped, return on first fetch | GOT/PLT slots point to `ret` stubs; `memset`, `memcpy`, `memmove`, `mempcpy`, `bzero`, `strlen` are emulated |
+| relocations in the emulator | not needed (preferred base) | `RELATIVE`, `GLOB_DAT`, `JUMP_SLOT`, `R_X86_64_64` applied; `IRELATIVE` ifuncs resolved by running the resolver |
+| code cave for `flat -o` | new `.unflat` section | a `PT_NOTE` program header turned into a new `R+X` `PT_LOAD` at the end of the file |
+
+ELF support covers executables, PIE, static and static-pie binaries and shared objects, with or without symbols and section headers.
 
 ## Mode 0: scan
 
@@ -49,7 +67,7 @@ verdict: bytecode VM suspected in 1 function(s)
   0x140001580      96 insns  fetch+dispatch sites 6   handler tables: 0x140004060 (9 entries)  -> unflat vm -e 0x140001580
 ```
 
-Tested for false positives on `tests/clean/clean.c` (switch statements, `qsort`, a table of function pointers): nothing flagged. The scan is a heuristic: confirm with `flat` or `vm`.
+Tested for false positives on `tests/clean/clean.c` (switch statements, `qsort`, a table of function pointers): nothing flagged. The scan is a heuristic: confirm with `flat` or `vm`. On statically linked ELF binaries, glibc's `printf` internals (a byte-indexed table of computed `goto` targets) can show up as a VM candidate.
 
 ## Mode 1: flat
 
@@ -86,9 +104,9 @@ The patched file is for static analysis only. Do not run it.
 2. Each block is emulated with Unicorn twice, forcing the selecting `cmovCC` or `setCC` both ways, with two random sets of unknown inputs. A target that does not change between the random runs is resolved.
 3. When a block depends on values set earlier (a state index, a base register, a table pointer spilled to the stack), unflat walks the function from its entry and carries known register and stack values from block to block. Calls are stepped over, and real conditional jumps are followed both ways.
 4. A branch that lands on `ud2`/`int3` is an opaque predicate and becomes an unconditional jump.
-5. The tail of the block is rewritten in place. Instructions between the `cmov` and the `jmp` that must still run are kept; if they change flags they are moved, together with the jump, into a small `.unflat` section.
+5. The tail of the block is rewritten in place. Instructions between the `cmov` and the `jmp` that must still run are kept; if they change flags they are moved, together with the jump, into a small code cave: a new `.unflat` section in a PE, a new `PT_LOAD` segment in an ELF.
 
-Function entries come from `.pdata`. For memory dumps without it (e.g. pe-sieve output) they come from the entry point, the exports and every direct `call` target.
+Function entries come from `.pdata` (PE) or from symbols and `.eh_frame` (ELF). For memory dumps without them (e.g. pe-sieve output) they come from the entry point, the exports or symbols, and every direct `call` target.
 
 ### Ghidra
 
@@ -109,6 +127,18 @@ analyzeHeadless <project_dir> <name> -import sample.unflat.dll -scriptPath ghidr
 | `unresolved` | could not be resolved |
 
 Dispatchers that are never reached from any function entry are usually dead blocks added by the obfuscator.
+
+### Test
+
+`tests/flat/flat.c` is a small hand-flattened function (`cmov` + `jmp reg` dispatchers, one of them needing a code cave). It builds as a PE or an ELF, and its output must be the same before and after patching:
+
+```
+gcc -O2 -o flat.elf tests/flat/flat.c
+unflat flat flat.elf -o flat.unflat.elf      # 2 cond + 4 goto resolved
+./flat.elf; ./flat.unflat.elf                # same numbers
+```
+
+Running the patched file is only meant for this test program you built yourself; patched samples are for static analysis.
 
 ### Results on WardenStealer
 
@@ -133,7 +163,8 @@ No `halt_baddata` or unrecovered jump tables in any of them.
 
 ### Limits
 
-- x64 PE only; dispatchers of the `jmp reg` kind (no `call reg`, no `jmp [mem]`).
+- x86-64 only (PE and ELF; no 32-bit, no ARM); dispatchers of the `jmp reg` kind (no `call reg`, no `jmp [mem]`).
+- The ELF code cave reuses a `PT_NOTE` program header; a file without one gets only the in-place patches (the ones that need a cave are reported as not patchable).
 - Values only known at runtime (read from TLS, the heap, or produced by a call) cannot be resolved statically; such dispatchers are reported, not guessed.
 - The result is correct control flow, not the original source structure: loops and `if`s come back as whatever the decompiler rebuilds from the patched jumps.
 
@@ -153,6 +184,7 @@ A VM-protected function no longer contains the original logic as x86 code: it ho
 unflat vm sample.exe -e vm_run                 # entry by export name
 unflat vm sample.exe -e 0x140001580 -a 0x10    # entry by address, rcx = 0x10
 unflat vm sample.exe -e 0x140001580 -o vm.txt  # report to a file
+unflat vm sample.elf -e vm_run -a 5            # ELF: symbol name, rdi = 5
 ```
 
 ### How handlers are classified
@@ -171,15 +203,18 @@ The handler's label is the most frequent guess over all its executions.
 
 ### Example
 
-`tests/toyvm/` holds a small stack VM in two flavours (threaded `jmp reg` dispatch, and a central `call [table]` loop). Build with mingw:
+`tests/toyvm/` holds a small stack VM in two flavours (threaded `jmp reg` dispatch, and a central `call [table]` loop). Build with mingw for PE, or with gcc for ELF:
 
 ```
 x86_64-w64-mingw32-gcc -O2 -o toyvm.exe tests/toyvm/toyvm.c
 x86_64-w64-mingw32-gcc -O2 -o toyvm_call.exe tests/toyvm/toyvm_call.c
 x86_64-w64-mingw32-gcc -O2 -o clean.exe tests/clean/clean.c
+
+gcc -O2 '-D__declspec(x)=' -o toyvm.elf tests/toyvm/toyvm.c
+gcc -O2 '-D__declspec(x)=' -static-pie -s -o toyvm_static.elf tests/toyvm/toyvm.c
 ```
 
-Both give the same virtual program, matching the C source:
+Both flavours, PE or ELF (dynamic, non-PIE, static-pie stripped), give the same virtual program, matching the C source:
 
 ```
 +0000  op ??  H00  push-const  00000000   const 0x0

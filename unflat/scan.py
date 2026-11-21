@@ -112,8 +112,8 @@ def scan(image, code):
 
 def sections_report(image):
     rows, hints = [], set()
-    for s, sec in zip(image.sections, image.pe.sections):
-        data = sec.get_data()
+    for s in image.sections:
+        data = image.section_data(s)
         rows.append((s.name, s.start, s.end - s.start, _entropy(data), s.executable))
         low = s.name.lower()
         for key, name in PROTECTORS.items():

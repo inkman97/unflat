@@ -6,12 +6,12 @@ from capstone.x86 import X86_OP_MEM, X86_OP_REG
 from unicorn import UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_MEM_UNMAPPED, UC_HOOK_MEM_WRITE, UC_MODE_64, Uc, UcError
 from unicorn import x86_const as X
 
+from .abi import setup_imports, setup_tls
 from .code import CANON
 
 UC_REG = {r: getattr(X, f"UC_X86_REG_{r.upper()}") for r in sorted(set(CANON.values()))}
 STACK, STACK_SIZE = 0x7FF000000, 0x200000
 SCRATCH, SCRATCH_SIZE = 0x10000000, 0x2000000
-TEB = 0x7FFD0000
 PAGE = 0x1000
 
 
@@ -26,6 +26,7 @@ class Dispatch:
     taken: Optional[int] = None
     fallthrough: Optional[int] = None
     opaque: bool = False
+    patch: Optional[tuple] = None
     status: str = "unresolved"
     alternatives: list = field(default_factory=list)
     selector: Optional[tuple] = None
@@ -45,9 +46,10 @@ class Resolver:
         self.uc.mem_map(image.base, size)
         self.uc.mem_write(image.base, bytes(image.mapped))
         self.img_lo, self.img_hi = image.base, image.base + size
-        for base, sz in ((STACK, STACK_SIZE), (SCRATCH, SCRATCH_SIZE), (TEB, 0x10000)):
+        for base, sz in ((STACK, STACK_SIZE), (SCRATCH, SCRATCH_SIZE)):
             self.uc.mem_map(base, sz)
-        self.uc.reg_write(X.UC_X86_REG_GS_BASE, TEB)
+        setup_tls(self.uc, image.abi)
+        setup_imports(self.uc, image, STACK + STACK_SIZE // 2)
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._map_page)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self._log_write)
         self.writes, self.force = [], None

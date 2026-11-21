@@ -4,9 +4,9 @@ from collections import defaultdict
 from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn import x86_const as X
 
+from .abi import VOLATILE
 from .resolver import SCRATCH, SCRATCH_SIZE, STACK, STACK_SIZE, UC_REG, apply_force
 
-VOLATILE = ("rax", "rcx", "rdx", "r8", "r9", "r10", "r11")
 STACK_TOP = STACK + STACK_SIZE // 2
 SEEDS = (11, 23)
 
@@ -45,7 +45,7 @@ class Explorer:
             apply_force(uc, self.force, addr + size)
             return
         if addr in self.code and self.code.mnemonic(addr) == "call":
-            for reg in VOLATILE:
+            for reg in VOLATILE[self.r.image.abi]:
                 uc.reg_write(UC_REG[reg], self._unknown())
             uc.reg_write(X.UC_X86_REG_RIP, addr + size)
 

@@ -6,10 +6,11 @@ from unicorn import (UC_ARCH_X86, UC_HOOK_CODE, UC_HOOK_MEM_FETCH_UNMAPPED, UC_H
                      UC_HOOK_MEM_READ_UNMAPPED, UC_HOOK_MEM_WRITE, UC_HOOK_MEM_WRITE_UNMAPPED, UC_MODE_64, Uc, UcError)
 from unicorn import x86_const as X
 
+from .abi import ARGS, setup_imports, setup_tls
+
 M64 = (1 << 64) - 1
 PAGE = 0x1000
 STACK, STACK_SIZE = 0x7FF000000, 0x400000
-TEB = 0x7FFD0000
 RETURN = 0xDEAD0000
 ALU = {"add", "sub", "xor", "and", "or", "imul", "mul", "shl", "shr", "sar", "rol", "ror", "not", "neg", "inc", "dec"}
 NATIVE = {"add": "add", "lea": "add", "inc": "add", "sub": "sub", "dec": "sub", "neg": "sub", "xor": "xor",
@@ -53,9 +54,8 @@ class Tracer:
         self.uc.mem_map(image.base, size)
         self.uc.mem_write(image.base, bytes(image.mapped))
         self.uc.mem_map(STACK, STACK_SIZE)
-        self.uc.mem_map(TEB, 0x10000)
-        self.uc.reg_write(X.UC_X86_REG_GS_BASE, TEB)
-        self.uc.mem_write(TEB + 0x30, TEB.to_bytes(8, "little"))
+        setup_tls(self.uc, image.abi, self_pointer=True)
+        setup_imports(self.uc, image, STACK + STACK_SIZE // 2)
         self.trace, self.mem = [], []
         self.uc.hook_add(UC_HOOK_CODE, self._code)
         self.uc.hook_add(UC_HOOK_MEM_READ, self._read)
@@ -97,8 +97,8 @@ class Tracer:
         sp -= 8
         self.uc.mem_write(sp, RETURN.to_bytes(8, "little"))
         self.uc.reg_write(X.UC_X86_REG_RSP, sp)
-        for reg, value in zip((X.UC_X86_REG_RCX, X.UC_X86_REG_RDX, X.UC_X86_REG_R8, X.UC_X86_REG_R9), args):
-            self.uc.reg_write(reg, value)
+        for reg, value in zip(ARGS[self.image.abi], args):
+            self.uc.reg_write(getattr(X, f"UC_X86_REG_{reg.upper()}"), value)
         try:
             self.uc.emu_start(entry, RETURN)
             self.error = None
