@@ -3,7 +3,7 @@
 Three helpers for obfuscated x86-64 code, in Windows PE and Linux ELF files:
 
 - **`unflat scan`**: tells you, per function, whether the code is control-flow flattened or runs a bytecode VM, and which command to run next.
-- **`unflat flat`**: resolves the register-indirect dispatchers of control-flow flattened code and patches them back into direct jumps, so that Ghidra, IDA or r2 can follow the code again.
+- **`unflat flat`**: resolves the indirect dispatchers of control-flow flattened code (`jmp reg`, `jmp [mem]`, `call reg`, `call [mem]`) and patches them back into direct jumps, so that Ghidra, IDA or r2 can follow the code again.
 - **`unflat vm`**: traces a function protected by a bytecode virtual machine and reports the dispatcher, the handlers, the bytecode and the virtual program it runs.
 
 ## Install
@@ -45,7 +45,7 @@ unflat scan sample.dll -v         # every flagged function
 
 For each function it counts:
 
-- `jmp reg` instructions and how many of them are preceded by a `cmovCC`/`setCC` that selects the target (flattening dispatchers), plus `ud2` opaque predicate traps;
+- indirect dispatchers (`jmp reg` and `jmp [mem]`, plus `call reg` / `call [mem]` when a `cmovCC`/`setCC` comes right before them) and how many of them are preceded by a `cmovCC`/`setCC` that selects the target, plus `ud2` opaque predicate traps;
 - byte fetches (`movzx reg, byte [reg]`) whose value indexes a table of 8-byte pointers right before an indirect `jmp`/`call` (VM opcode dispatch);
 - tables of code pointers in data sections that the function references (handler tables).
 
@@ -55,9 +55,9 @@ Example on WardenStealer stage 1:
 
 ```
 verdict: control-flow flattening in 3 function(s)
-  0x1800011dd    6265 insns  jmp-reg 354  selected 311  ud2 21   -> unflat flat -f 0x1800011dd -l out.txt
-  0x18000a346     221 insns  jmp-reg 11   selected 10   ud2 1    -> unflat flat -f 0x18000a346 -l out.txt
-  0x180009faa     161 insns  jmp-reg 6    selected 5    ud2 0    -> unflat flat -f 0x180009faa -l out.txt
+  0x1800011dd    6265 insns  indirect 354  selected 311  ud2 21   -> unflat flat -f 0x1800011dd -l out.txt
+  0x18000a346     221 insns  indirect 11   selected 10   ud2 1    -> unflat flat -f 0x18000a346 -l out.txt
+  0x180009faa     161 insns  indirect 6    selected 5    ud2 0    -> unflat flat -f 0x180009faa -l out.txt
 ```
 
 and on the toy VM:
@@ -85,6 +85,22 @@ jmp    rcx
 
 Disassemblers stop at `jmp rcx`. unflat works out where each of these jumps can go and rewrites the tail as `jcc taken / jmp fallthrough`.
 
+The last instruction can also read the target from memory, or be a call:
+
+| dispatcher | example | how the target is read |
+|---|---|---|
+| `jmp reg` | `jmp rcx` | register value at the jump |
+| `jmp [mem]` | `jmp qword [rdx + rcx*8]`, `jmp qword [rip + slot]` | 8 bytes at the effective address, read from the emulated memory (so tables filled or decrypted at runtime are seen as they are at the jump) |
+| `call reg` | `call rdx` | register value at the call |
+| `call [mem]` | `call qword [rax + 0x10]` | as `jmp [mem]` |
+
+A `call` used as a dispatcher also pushes a return address, and the patch has to respect what the target does with it:
+
+- **discard**: every target throws it away as its first instruction (`lea rsp, [rsp + 8]`, `add rsp, 8` with the flags rewritten before they are read, or `pop` into a register that is overwritten before it is read). The call is really a jump: it is patched as one, straight to the instruction after the discard.
+- **keep**: anything else (for example helpers that end in `ret` and come back after the call). The patch pushes exactly the return address the original call pushed: a goto becomes a direct `call target` that ends where the original call ended; a conditional one becomes `jcc` to a cave stub that pushes the return address and jumps, plus a direct `call` for the other target. The push is position-independent and leaves flags and registers untouched.
+
+`-v` shows the kind of each dispatcher and, for calls, the mode chosen.
+
 ### Usage
 
 ```
@@ -100,11 +116,11 @@ The patched file is for static analysis only. Do not run it.
 
 ### How it works
 
-1. Every `jmp reg` in executable sections is a candidate dispatcher.
+1. Every `jmp reg` and `jmp [mem]` in executable sections is a candidate dispatcher. A `call reg` / `call [mem]` is a candidate when a `cmovCC`/`setCC` picks its target, or (`call reg`) when the register is loaded with a constant code address in the same block; calls through function pointers are left alone. Memory slots filled by the loader (IAT, GOT, IRELATIVE/ifunc) and `[base + index*scale]` jumps whose index is loaded from memory in the same block (VM opcode fetches, see `unflat vm`) are skipped.
 2. Each block is emulated with Unicorn twice, forcing the selecting `cmovCC` or `setCC` both ways, with two random sets of unknown inputs. A target that does not change between the random runs is resolved.
 3. When a block depends on values set earlier (a state index, a base register, a table pointer spilled to the stack), unflat walks the function from its entry and carries known register and stack values from block to block. Calls are stepped over, and real conditional jumps are followed both ways.
 4. A branch that lands on `ud2`/`int3` is an opaque predicate and becomes an unconditional jump.
-5. The tail of the block is rewritten in place. Instructions between the `cmov` and the `jmp` that must still run are kept; if they change flags they are moved, together with the jump, into a small code cave: a new `.unflat` section in a PE, a new `PT_LOAD` segment in an ELF.
+5. The tail of the block is rewritten in place. Instructions between the `cmov` and the `jmp` that must still run are kept; if they change flags, or don't leave room for the new jumps, they are moved, together with the jump, into a small code cave: a new `.unflat` section in a PE, a new `PT_LOAD` segment in an ELF.
 
 Function entries come from `.pdata` (PE) or from symbols and `.eh_frame` (ELF). For memory dumps without them (e.g. pe-sieve output) they come from the entry point, the exports or symbols, and every direct `call` target.
 
@@ -121,7 +137,7 @@ analyzeHeadless <project_dir> <name> -import sample.unflat.dll -scriptPath ghidr
 | status | meaning |
 |---|---|
 | `cond` | two targets selected by a condition, patched to `jcc` + `jmp` |
-| `goto` | single target (including removed opaque predicates), patched to `jmp` |
+| `goto` | single target (including removed opaque predicates), patched to `jmp` (or a direct `call` for a call dispatcher in keep mode) |
 | `context` | target depends on the incoming path; reported, not patched |
 | `switch` | compiler jump table with an index register (not flattening); left alone |
 | `unresolved` | could not be resolved |
@@ -130,17 +146,27 @@ Dispatchers that are never reached from any function entry are usually dead bloc
 
 ### Test
 
-`tests/flat/flat.c` is a small hand-flattened function (`cmov` + `jmp reg` dispatchers, one of them needing a code cave). It builds as a PE or an ELF, and its output must be the same before and after patching:
+Three small hand-flattened functions, one per dispatcher family. Each builds as a PE or an ELF, and its output must be the same before and after patching:
+
+| test | dispatchers | expected |
+|---|---|---|
+| `tests/flat/flat.c` | `cmov` + `jmp reg` | 2 cond + 4 goto, all patched |
+| `tests/flat/flat_mem.c` | `jmp [reg]`, `jmp [reg + index*8]` selected by `setCC`, `jmp [rip + slot]` | 2 cond + 4 goto, all patched |
+| `tests/flat/flat_call.c` | `call reg` into blocks that discard the return address, and into helpers that return | 3 cond + 5 goto, all patched (6 discard, 2 keep) |
 
 ```
-gcc -O2 -o flat.elf tests/flat/flat.c
-unflat flat flat.elf -o flat.unflat.elf      # 2 cond + 4 goto resolved
-./flat.elf; ./flat.unflat.elf                # same numbers
+gcc -O2 -o flat_call.elf tests/flat/flat_call.c
+unflat flat flat_call.elf -o flat_call.unflat.elf
+./flat_call.elf; ./flat_call.unflat.elf      # same numbers
 ```
+
+They give the same output before and after patching as PIE, non-PIE and static-pie stripped ELF. The PE builds were checked by running the original and the patched function in an emulator, since there was no Windows host at hand.
 
 Running the patched file is only meant for this test program you built yourself; patched samples are for static analysis.
 
 ### Results on WardenStealer
+
+Measured with version 0.3.0 (before `jmp [mem]` / `call` support and the code-cave fallback for flag-safe instructions).
 
 | | stage 1 (fake jli.dll) | stage 2 (in-memory payload) |
 |---|---|---|
@@ -163,7 +189,9 @@ No `halt_baddata` or unrecovered jump tables in any of them.
 
 ### Limits
 
-- x86-64 only (PE and ELF; no 32-bit, no ARM); dispatchers of the `jmp reg` kind (no `call reg`, no `jmp [mem]`).
+- x86-64 only (PE and ELF; no 32-bit, no ARM).
+- `call reg` with a constant target is only taken as a dispatcher when the register is loaded in the same block; `call [mem]` only when a `cmov`/`setCC` picks the target. A call whose targets don't simply discard the return address is patched in "keep" mode, which is correct but less readable in a decompiler than a plain jump.
+- `jmp [base + index*scale]` without a `cmov`/`setCC` and with a data-dependent index (compiler switch, VM dispatch) is left alone or reported as `switch`.
 - The ELF code cave reuses a `PT_NOTE` program header; a file without one gets only the in-place patches (the ones that need a cave are reported as not patchable).
 - Values only known at runtime (read from TLS, the heap, or produced by a call) cannot be resolved statically; such dispatchers are reported, not guessed.
 - The result is correct control flow, not the original source structure: loops and `if`s come back as whatever the decompiler rebuilds from the patched jumps.

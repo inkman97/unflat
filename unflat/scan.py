@@ -16,6 +16,7 @@ TABLE_JUMP = re.compile(r"qword ptr \[(\w+) \+ (\w+)\*8(?: [+-] 0x[0-9a-f]+)?\]"
 INDEX8 = re.compile(r"\+ (\w+)\*8")
 BYTE_FETCH = re.compile(r"byte ptr \[(\w+)(?: [+-] [^\]]+)?\]")
 SELECT = ("cmov", "set")
+RIP_ONLY = re.compile(r"\[rip [+-] 0x[0-9a-f]+\]$")
 
 
 @dataclass
@@ -87,14 +88,20 @@ def scan(image, code):
                     refs.add(table_starts[t])
             if mnem == "ud2":
                 f.opaque += 1
-            indirect = (mnem in ("jmp", "call") and (CANON.get(ops) == ops or TABLE_JUMP.search(ops)))
-            if not indirect:
+            reg_op = CANON.get(ops) == ops
+            mem_op = "ptr [" in ops and not RIP_ONLY.search(ops)
+            indirect = (mnem in ("jmp", "call") and (reg_op or TABLE_JUMP.search(ops)))
+            dispatch = mnem in ("jmp", "call") and (reg_op or mem_op)
+            if not indirect and not dispatch:
                 continue
             back = addrs[max(0, k - 10):k]
-            if mnem == "jmp" and CANON.get(ops) == ops:
+            selected = any(code.lite[b][1].startswith(SELECT) for b in back)
+            # jmp reg / jmp [mem]: every one counts; call reg / call [mem]: only when a cmov/setCC picks the target
+            if dispatch and (mnem == "jmp" or selected):
                 f.jmp_reg += 1
-                if any(code.lite[b][1].startswith(SELECT) for b in back):
-                    f.selected += 1
+                f.selected += selected
+            if not indirect:
+                continue
             window = back + [va]
             for n, b in enumerate(window):
                 bm, bo = code.lite[b][1], code.lite[b][2]
@@ -141,7 +148,7 @@ def report(image, code, results, out, verbose=False):
     if flat:
         out.write(f"\nflattened functions ({len(flat)}), by selected dispatchers:\n")
         for f in flat[: None if verbose else 15]:
-            out.write(f"  {f.start:#x}  {f.insns:>6} insns  jmp-reg {f.jmp_reg:<4} selected {f.selected:<4} ud2 {f.opaque:<3}"
+            out.write(f"  {f.start:#x}  {f.insns:>6} insns  indirect {f.jmp_reg:<4} selected {f.selected:<4} ud2 {f.opaque:<3}"
                       f"  -> unflat flat -f {f.start:#x} -l out.txt\n")
         if not verbose and len(flat) > 15:
             out.write(f"  ... {len(flat) - 15} more (use -v)\n")
@@ -156,5 +163,5 @@ def report(image, code, results, out, verbose=False):
         out.write("\nall functions with indirect jumps:\n")
         for f in results:
             if f.jmp_reg or f.fetch_dispatch:
-                out.write(f"  {f.start:#x}  insns {f.insns:<6} jmp-reg {f.jmp_reg:<4} selected {f.selected:<4}"
+                out.write(f"  {f.start:#x}  insns {f.insns:<6} indirect {f.jmp_reg:<4} selected {f.selected:<4}"
                           f" fetch+dispatch {f.fetch_dispatch:<3} tables {len(f.tables)}\n")
