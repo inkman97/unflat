@@ -5,7 +5,7 @@ from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE, UcError
 from unicorn import x86_const as X
 
 from .abi import VOLATILE
-from .resolver import SCRATCH, SCRATCH_SIZE, STACK, STACK_SIZE, UC_REG, apply_force
+from .resolver import SCRATCH, SCRATCH_SIZE, STACK, STACK_SIZE, UC_REG, apply_force, read_target
 
 STACK_TOP = STACK + STACK_SIZE // 2
 SEEDS = (11, 23)
@@ -32,7 +32,7 @@ class Explorer:
         for d in dispatches:
             self.dispatch[d.jmp] = d
             self.stops.add(d.jmp)
-            d.selector = self.r.selector_of(self.code.span(d.start, d.jmp), d.reg)
+            d.selector = self.r.selector_of(self.code.span(d.start, d.jmp), d.regs)
 
     def _step(self, uc, addr, size, _):
         if not self.active:
@@ -75,6 +75,8 @@ class Explorer:
         except UcError:
             self.stop_at = None
         self.active = False
+        d = self.dispatch.get(self.stop_at)
+        target = read_target(self.uc, self.code, d) if d is not None else None
         out_regs = {name: self.uc.reg_read(uc_reg) for name, uc_reg in UC_REG.items()}
         out_stack = {}
         for addr, size, value in self.stack_log:
@@ -83,7 +85,7 @@ class Explorer:
                 self.dirty.add(base)
         for addr, old in reversed(self.r.writes):
             self.uc.mem_write(addr, old)
-        return self.stop_at, out_regs, {**stack, **out_stack}
+        return self.stop_at, out_regs, {**stack, **out_stack}, target
 
     def _known(self, a, b):
         return {k: v for k, v in a.items() if b.get(k) == v and not SCRATCH <= v < SCRATCH + SCRATCH_SIZE}
@@ -125,17 +127,37 @@ class Explorer:
             runs = [self._run(start, regs, stack, s, force) for s in SEEDS]
             if runs[0][0] != end or runs[1][0] != end:
                 continue
-            target = runs[0][1][d.reg]
-            if target != runs[1][1][d.reg] or target not in self.code:
+            target = runs[0][3]
+            if target is None or target != runs[1][3] or target not in self.code:
                 self.results[d.jmp][variant].add(None)
                 continue
             self.results[d.jmp][variant].add(target)
             nregs, nstack = self._merge(runs)
-            out.append((target, nregs, nstack))
+            if d.is_call:
+                out.extend(self._call_successors(d, target, nregs, nstack))
+            else:
+                out.append((target, nregs, nstack))
+        return out
+
+    def _call_successors(self, d, target, regs, stack):
+        """A call pushes its return address. If the target doesn't throw it away, it probably comes back right
+        after the call, with the volatile registers clobbered: follow that path too."""
+        regs, stack = dict(regs), dict(stack)
+        rsp = regs.get("rsp")
+        if rsp is not None:
+            regs["rsp"] = rsp - 8
+            if rsp % 8 == 0:
+                stack[rsp - 8] = d.ret
+        out = [(target, regs, stack)]
+        if self.r.discard_skip(target) is None:
+            back = {k: v for k, v in regs.items() if k not in VOLATILE[self.r.image.abi]}
+            if rsp is not None:
+                back["rsp"] = rsp
+            out.append((d.ret, back, {k: v for k, v in stack.items() if k != (rsp or 0) - 8}))
         return out
 
     def _merge(self, runs):
-        (_, ra, sa), (_, rb, sb) = runs
+        (_, ra, sa, _), (_, rb, sb, _) = runs
         return self._known(ra, rb), self._known(sa, sb)
 
     def apply(self, dispatches):

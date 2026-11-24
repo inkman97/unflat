@@ -15,6 +15,26 @@ def _jcc(cc, src, dst):
     return bytes([0x0F, 0x80 | cc]) + struct.pack("<i", dst - (src + 6))
 
 
+def _call(src, dst):
+    return b"\xE8" + struct.pack("<i", dst - (src + 5))
+
+
+def _push_ret(at, ret):
+    """Push the address `ret` as a call would, from code placed at `at`.
+
+    Position-independent (the image may be loaded anywhere), leaves flags and registers untouched:
+        lea  rsp, [rsp - 8]
+        push rax
+        lea  rax, [rip + ret]
+        mov  [rsp + 8], rax
+        pop  rax
+    """
+    lea_rax = at + 6
+    return (b"\x48\x8D\x64\x24\xF8" + b"\x50"
+            + b"\x48\x8D\x05" + struct.pack("<i", ret - (lea_rax + 7))
+            + b"\x48\x89\x44\x24\x08" + b"\x58")
+
+
 def _relocate(code, va, new_va):
     ins = code.insn(va)
     raw = bytearray(ins.bytes)
@@ -29,11 +49,16 @@ class Cave:
         self.va = (image.end + 0xFFF) & ~0xFFF
         self.data = bytearray()
 
-    def add(self, code, keep, target):
+    def add(self, code, keep, target, push_ret=None):
+        """Append a stub: the kept instructions, optionally a push of the return address `push_ret`, a jmp."""
         va = self.va + len(self.data)
         cursor = va
         for k in keep:
             raw = _relocate(code, k, cursor)
+            self.data += raw
+            cursor += len(raw)
+        if push_ret is not None:
+            raw = _push_ret(cursor, push_ret)
             self.data += raw
             cursor += len(raw)
         self.data += _jmp(cursor, target)
@@ -45,33 +70,82 @@ def plan(code, d, cave):
         return None
     start = d.cmov if d.cmov is not None else _first_link(code, d)
     if start is None:
-        return None
+        start = d.jmp  # nothing to drop before it (e.g. jmp [rip + slot])
     region = code.span(start, d.jmp)
     drop = _dispatch_chain(code, d, region)
     keep = [va for va in region if va not in drop]
     if any(code.mnemonic(va).startswith(CONTROL) for va in keep):
         return None
     end = d.jmp + d.size
+    if d.is_call and d.call_mode != "discard":
+        return _plan_keep(code, d, cave, start, keep, end)
     targets = [d.taken, d.fallthrough] if d.status == "cond" else [d.taken]
-    out, cursor = bytearray(), start
     if all(code.mnemonic(va) in FLAG_SAFE for va in keep):
-        for va in keep:
-            raw = _relocate(code, va, cursor)
-            out += raw
-            cursor += len(raw)
-    else:
-        targets = [cave.add(code, keep, t) for t in targets]
+        # Everything kept runs after the selector and leaves the flags alone: keep it in place if it fits.
+        out = _branch_out(code, keep, start, targets, d.cc)
+        if start + len(out) <= end:
+            return start, out + b"\x90" * (end - start - len(out))
+        if not keep:
+            return None
+    # Kept instructions move into the cave, one copy per target, after the jcc has consumed the flags.
+    targets = [cave.add(code, keep, t) for t in targets]
+    out = _branch_out(code, [], start, targets, d.cc)
+    if start + len(out) > end:
+        return None
+    return start, out + b"\x90" * (end - start - len(out))
+
+
+def _branch_out(code, keep, start, targets, cc):
+    out, cursor = bytearray(), start
+    for va in keep:
+        raw = _relocate(code, va, cursor)
+        out += raw
+        cursor += len(raw)
     if len(targets) == 2:
-        out += _jcc(d.cc, cursor, targets[0])
+        out += _jcc(cc, cursor, targets[0])
         cursor += 6
     out += _jmp(cursor, targets[-1])
+    return bytes(out)
+
+
+def _plan_keep(code, d, cave, start, keep, end):
+    """Patch a call dispatcher so that its targets still find the original return address on the stack.
+
+    goto: a direct `call target` placed so that it ends exactly where the original call ended.
+    cond: `jcc stub_taken` + `call fallthrough` (ending where the original call ended), where the stub pushes the
+    original return address and jumps; or, when that doesn't fit, two stubs that each push it.
+    """
+    out, cursor = bytearray(), start
+    flag_safe = all(code.mnemonic(va) in FLAG_SAFE for va in keep)
+    relocated = bytearray()
+    for va in keep:
+        raw = _relocate(code, va, start + len(relocated))
+        relocated += raw
+    push = d.ret
+    if d.status == "goto":
+        if len(relocated) + 5 <= end - start:
+            pad = end - 5 - (start + len(relocated))
+            return start, bytes(relocated) + b"\x90" * pad + _call(end - 5, d.taken)
+        stub = cave.add(code, keep, d.taken, push)
+        out = _jmp(start, stub)
+    else:
+        if flag_safe and len(relocated) + 11 <= end - start:
+            stub = cave.add(code, [], d.taken, push)
+            pad = end - 11 - (start + len(relocated))
+            body = bytes(relocated) + b"\x90" * pad
+            jcc_at = start + len(body)
+            return start, body + _jcc(d.cc, jcc_at, stub) + _call(end - 5, d.fallthrough)
+        stubs = [cave.add(code, keep, t, push) for t in (d.taken, d.fallthrough)]
+        out += _jcc(d.cc, cursor, stubs[0])
+        cursor += 6
+        out += _jmp(cursor, stubs[1])
     if start + len(out) > end:
         return None
     return start, bytes(out) + b"\x90" * (end - start - len(out))
 
 
 def _dispatch_chain(code, d, region):
-    owned = {d.reg}
+    owned = set(d.regs)
     if d.cmov is not None:
         owned.add(code.regs(d.cmov)[1].pop())
     chain = {d.jmp}
@@ -86,7 +160,7 @@ def _first_link(code, d):
     first = None
     for va in reversed(code.span(d.start, d.jmp)[:-1]):
         written = code.regs(va)[1]
-        if written and written <= {d.reg}:
+        if written and written <= set(d.regs):
             first = va
         elif code.mnemonic(va) not in FLAG_SAFE:
             break

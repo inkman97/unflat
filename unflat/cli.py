@@ -99,7 +99,8 @@ def run_flat(args, image, code):
         if d.status == "unresolved" and resolver.is_switch(d):
             d.status = "switch"
     by_jmp = {d.jmp: d for d in dispatches}
-    edges = {d.jmp: d.targets for d in dispatches if d.targets}
+    edges = {d.jmp: d.targets + ([d.ret] if d.is_call and d.call_mode == "keep" else [])
+             for d in dispatches if d.targets}
 
     reachable = set()
     for start, end in image.functions:
@@ -117,7 +118,9 @@ def run_flat(args, image, code):
         for d in dispatches:
             tgt = ", ".join(f"{t:#x}" for t in d.targets) or "-"
             flag = "" if d.jmp in reachable else "  (not reached)"
-            print(f"  {d.jmp:#x} jmp {d.reg:<4} {d.status:<10} {tgt}{'  opaque' if d.opaque else ''}{flag}")
+            mode = f"  ({d.call_mode} return address)" if d.call_mode else ""
+            print(f"  {d.jmp:#x} {code.mnemonic(d.jmp)} {code.lite[d.jmp][2]:<24} {d.status:<10} {tgt}"
+                  f"{'  opaque' if d.opaque else ''}{mode}{flag}")
     print(f"reachable instructions from function entries: {cfg.coverage(code, image.functions, {})} -> {len(reachable)}")
 
     if args.output:

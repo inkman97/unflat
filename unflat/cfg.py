@@ -29,6 +29,9 @@ def walk(code, entry, edges, bounds=None):
             if mnem == "jmp":
                 succ = list(edges.get(va, [])) or [t for t in [_direct_target(code, va)] if t is not None]
                 break
+            if mnem == "call" and va in edges:
+                succ = list(edges[va])
+                break
             if mnem.startswith("j"):
                 succ = [t for t in [_direct_target(code, va)] if t is not None] + [code.after(va)]
                 break
@@ -56,11 +59,12 @@ def listing(code, blocks, dispatch_by_jmp, out):
         for va in insns:
             size, mnem, ops = code.lite[va]
             d = dispatch_by_jmp.get(va)
+            back = f", then back to loc_{d.ret:x}" if d and d.is_call and d.call_mode == "keep" else ""
             if d and d.status == "cond":
-                out.write(f"  {va:016x}  {mnem} {ops:<24} ; if {CC[d.cc]} -> loc_{d.taken:x} else loc_{d.fallthrough:x}\n")
+                out.write(f"  {va:016x}  {mnem} {ops:<24} ; if {CC[d.cc]} -> loc_{d.taken:x} else loc_{d.fallthrough:x}{back}\n")
             elif d and d.status == "goto":
                 note = " (opaque predicate removed)" if d.opaque else ""
-                out.write(f"  {va:016x}  {mnem} {ops:<24} ; goto loc_{d.taken:x}{note}\n")
+                out.write(f"  {va:016x}  {mnem} {ops:<24} ; goto loc_{d.taken:x}{note}{back}\n")
             elif d and d.status == "context":
                 alts = ", ".join(f"loc_{t:x}" for t in d.targets)
                 out.write(f"  {va:016x}  {mnem} {ops:<24} ; depends on the incoming path: {alts}\n")
